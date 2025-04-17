@@ -1,0 +1,149 @@
+#!/bin/bash
+
+# 设置计算参数
+num_cases=51
+start_value=1e5
+end_value=1.18e5
+cores_per_task=4
+final_time=20000  # 最终时间步目录名
+
+# 生成51个均匀分布的值（从1e5到1.18e5）
+generate_values() {
+  local start=100000  # 1e5
+  local end=118000    # 1.18e5
+  for ((i=0; i<num_cases; i++)); do
+    value=$(echo "scale=0; $start + ($end - $start)*$i/($num_cases-1)" | bc)
+    if [ $i -eq 0 ]; then
+      echo "1e5"  # 第一个值保持为1e5
+    else
+      printf "%.5e\n" $value | sed 's/\.0*e/e/' | sed 's/+0//'
+    fi
+  done
+}
+
+list=($(generate_values))
+
+# 检查案例是否已计算完成
+is_case_completed() {
+  local case_dir=$1
+  [ -d "$case_dir/$final_time" ] && return 0 || return 1
+}
+
+
+
+
+# 1. 计算基准案例 (case_1e5)
+base_case="case_1e5"
+echo "===== 处理基准案例 $base_case ====="
+
+if is_case_completed "$base_case"; then
+  echo "案例 $base_case 已计算完成，跳过"
+else
+  (
+    cd "$base_case" || { echo "错误：$base_case目录不存在"; exit 1; }
+    
+    # 检查初始条件
+    [ ! -d "0" ] && { echo "错误：0目录不存在"; exit 1; }
+    
+    # 并行计算
+    echo "使用${cores_per_task}个核心计算基准案例..."
+    decomposePar
+    mpirun -np $cores_per_task rhoSimpleFoam -parallel
+    reconstructPar
+    
+    # 验证计算结果
+    [ ! -d "$final_time" ] && { echo "错误：未生成$final_time时间步"; exit 1; }
+  )
+fi
+echo "===== 基准案例处理完成 ====="
+
+# 2. 准备其他50个案例
+echo "===== 准备其他案例 ====="
+for value in "${list[@]:1}"; do  # 跳过第一个案例（基准案例）
+  case_dir="case_${value}"
+  
+  if is_case_completed "$case_dir"; then
+    echo "案例 $case_dir 已存在并计算完成，跳过"
+    continue
+  fi
+  
+  # 从基准案例复制初始条件
+  echo "准备案例目录: $case_dir"
+  mkdir -p "$case_dir"
+  cp -r "$base_case/0" "$case_dir/"
+  cp -r "$base_case/constant" "$case_dir/"
+  cp -r "$base_case/system" "$case_dir/"
+  
+  # 修改边界条件
+  (
+    cd "$case_dir" || exit 1
+    foamDictionary -entry "boundaryField.OUTLET.meanValue" -set "constant $value" 0/p
+    foamDictionary -entry "boundaryField.OUTLET.value" -set "uniform $value" 0/p
+  )
+done
+
+# 3. 并行计算其他案例
+echo "===== 开始并行计算其他案例 ====="
+
+
+
+
+# 正确的并行度计算方式
+available_cores=$(nproc)  # 获取系统总核心数
+max_parallel=$(( available_cores / cores_per_task ))
+
+# 确保至少有1个并行任务
+[ $max_parallel -lt 1 ] && max_parallel=1
+
+
+counter=0
+
+for value in "${list[@]:1}"; do  # 跳过第一个案例（基准案例）
+  case_dir="case_${value}"
+  
+  # 检查是否已完成
+  if is_case_completed "$case_dir"; then
+    echo "案例 $case_dir 已计算完成，跳过"
+    continue
+  fi
+  
+  (
+    echo "开始计算案例: $case_dir"
+    cd "$case_dir" || exit 1
+    
+    # 并行计算
+    decomposePar
+    mpirun -np $cores_per_task rhoSimpleFoam -parallel
+    reconstructPar
+    
+    # 检查计算结果
+    [ ! -d "$final_time" ] && echo "警告：案例 $case_dir 未生成$final_time时间步"
+  ) > "$case_dir/calculation.log" 2>&1 &
+  
+  # 并行度控制
+  ((counter++))
+  if (( counter % max_parallel == 0 )); then
+    wait  # 等待一批任务完成
+  fi
+done
+
+# 等待所有剩余任务完成
+wait
+echo "===== 案例处理完成 ====="
+
+# 验证所有案例结果
+success_count=0
+total_cases=${#list[@]}
+for value in "${list[@]}"; do
+  case_dir="case_${value}"
+  if is_case_completed "$case_dir"; then
+    ((success_count++))
+  else
+    echo "未完成案例: $case_dir"
+  fi
+done
+
+echo "完成统计:"
+echo "总案例数: $total_cases"
+echo "成功计算: $success_count"
+echo "跳过/未完成: $((total_cases - success_count))"
